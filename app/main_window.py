@@ -52,6 +52,7 @@ class MainWindow(QMainWindow):
         # 창 표시 후 무거운 작업 지연 실행
         QTimer.singleShot(0, self._load_history)
         QTimer.singleShot(100, self._auto_check_ytdlp_update)
+        QTimer.singleShot(200, self._check_dependencies)
 
     def _setup_menubar(self):
         menubar = self.menuBar()
@@ -282,6 +283,50 @@ class MainWindow(QMainWindow):
         from app.bridge.bridge_server import BridgeServer
         self._bridge_server = BridgeServer(self, parent=self)
         self._bridge_server.start()
+
+    # ── Dependency check ────────────────────────────────────────
+
+    def _check_dependencies(self):
+        from app.utils.dependency_installer import (
+            find_ffmpeg, find_deno, add_tools_to_path,
+            DependencyInstaller,
+        )
+        add_tools_to_path()
+        need_ffmpeg = find_ffmpeg() is None
+        need_deno = find_deno() is None
+
+        if not need_ffmpeg and not need_deno:
+            return
+
+        names = []
+        if need_ffmpeg:
+            names.append("ffmpeg")
+        if need_deno:
+            names.append("deno")
+
+        reply = QMessageBox.question(
+            self, "의존성 설치",
+            f"{', '.join(names)}이(가) 설치되어 있지 않습니다.\n"
+            "자동으로 다운로드하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._dep_installer = DependencyInstaller(
+            install_ffmpeg=need_ffmpeg,
+            install_deno=need_deno,
+        )
+        self._dep_installer.status.connect(self.status_bar.showMessage)
+        self._dep_installer.finished.connect(self._on_dep_install_finished)
+        self._dep_installer.start()
+
+    def _on_dep_install_finished(self, success: bool, msg: str):
+        if success:
+            self.status_bar.showMessage(msg, 5000)
+        else:
+            QMessageBox.warning(self, "의존성 설치 오류", msg)
+            self.status_bar.showMessage("의존성 설치 실패", 5000)
 
     # ── Load history ───────────────────────────────────────────
 

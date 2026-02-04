@@ -31,6 +31,9 @@ nul
 # Database
 *.db
 
+# Downloaded tools
+tools/
+
 # Claude Code
 .claude/
 
