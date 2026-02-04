@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build
+        run: python -m PyInstaller StockVideoAutomator.spec --clean -y
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StockVideoAutomator-Windows
+          path: dist/StockVideoAutomator/
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build
+        run: python -m PyInstaller StockVideoAutomator-mac.spec --clean -y
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StockVideoAutomator-macOS
+          path: dist/StockVideoAutomator.app/
