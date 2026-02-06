@@ -5,12 +5,33 @@ from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QPushButton,
     QSizePolicy,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QUrl
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QUrl, QThread
 from PyQt6.QtGui import QPixmap, QDesktopServices, QMouseEvent
-import requests
 
 from app.models.video_info import VideoInfo
 from app.utils.helpers import format_duration, format_file_size, format_speed
+
+
+class _ThumbnailLoader(QThread):
+    """Background thread to download a thumbnail image."""
+
+    loaded = pyqtSignal(bytes)  # raw image data
+    failed = pyqtSignal()
+
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self._url = url
+
+    def run(self):
+        try:
+            import requests
+            resp = requests.get(self._url, timeout=5)
+            if resp.status_code == 200:
+                self.loaded.emit(resp.content)
+            else:
+                self.failed.emit()
+        except Exception:
+            self.failed.emit()
 
 
 class DownloadItemWidget(QWidget):
@@ -121,20 +142,25 @@ class DownloadItemWidget(QWidget):
         if not self.video_info.thumbnail_url:
             self.lbl_thumbnail.setText("No Image")
             return
-        try:
-            resp = requests.get(self.video_info.thumbnail_url, timeout=5)
-            if resp.status_code == 200:
-                pixmap = QPixmap()
-                pixmap.loadFromData(resp.content)
-                self.lbl_thumbnail.setPixmap(
-                    pixmap.scaled(
-                        100, 56,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
-        except Exception:
-            self.lbl_thumbnail.setText("No Image")
+        self.lbl_thumbnail.setText("...")
+        self._thumb_loader = _ThumbnailLoader(self.video_info.thumbnail_url, self)
+        self._thumb_loader.loaded.connect(self._on_thumbnail_loaded)
+        self._thumb_loader.failed.connect(self._on_thumbnail_failed)
+        self._thumb_loader.start()
+
+    def _on_thumbnail_loaded(self, data: bytes):
+        pixmap = QPixmap()
+        pixmap.loadFromData(data)
+        self.lbl_thumbnail.setPixmap(
+            pixmap.scaled(
+                100, 56,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _on_thumbnail_failed(self):
+        self.lbl_thumbnail.setText("No Image")
 
     def update_progress(self, data: dict):
         status = data.get("status", "")

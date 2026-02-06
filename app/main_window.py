@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QInputDialog, QMenuBar, QMenu, QFileDialog,
     QSystemTrayIcon,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence, QIcon
 
 from app.widgets.toolbar import ToolBar
@@ -17,6 +17,7 @@ from app.widgets.download_item import DownloadItemWidget
 from app.widgets.control_panel import ControlPanel
 from app.models.video_info import VideoInfo
 from app.models.database import DownloadDatabase
+from app.download_manager import DownloadManager
 from app.utils.helpers import is_youtube_url, resource_path
 from app.utils.settings_manager import SettingsManager
 
@@ -36,9 +37,9 @@ class MainWindow(QMainWindow):
 
         self._settings = SettingsManager()
         self.db = DownloadDatabase()
-        self._workers: Dict[str, DownloadWorker] = {}
-        self._download_queue: deque = deque()  # queued VideoInfo objects
+        self._dl_manager = DownloadManager(self._settings, parent=self)
         self._info_worker: Optional[InfoWorker] = None
+        self._info_queue: deque = deque()  # queued URLs for info fetching
         self._update_worker: Optional[YtDlpUpdateWorker] = None
         self._force_quit = False
 
@@ -252,6 +253,12 @@ class MainWindow(QMainWindow):
         self.download_list.count_changed.connect(self.tab_bar.set_count)
         self.download_list.cancel_requested.connect(self._cancel_download)
 
+        # Download manager signals
+        self._dl_manager.download_progress.connect(self._on_download_progress)
+        self._dl_manager.download_finished.connect(self._on_download_finished)
+        self._dl_manager.download_error.connect(self._on_download_error)
+        self._dl_manager.status_message.connect(self.status_bar.showMessage)
+
         # Control panel signals
         self.control_panel.preferences_requested.connect(self._show_preferences)
         self.control_panel.login_requested.connect(self._on_youtube_login)
@@ -330,9 +337,14 @@ class MainWindow(QMainWindow):
 
     def _fetch_info(self, url: str):
         if self._info_worker and self._info_worker.isRunning():
-            QMessageBox.information(self, "알림", "이미 정보를 가져오는 중입니다.")
+            self._info_queue.append(url)
+            queued = len(self._info_queue)
+            self.status_bar.showMessage(f"대기열에 추가됨 ({queued}개 대기 중)")
             return
 
+        self._start_info_worker(url)
+
+    def _start_info_worker(self, url: str):
         self.status_bar.showMessage("영상 정보를 가져오는 중...")
         from app.workers.info_worker import InfoWorker
         self._info_worker = InfoWorker(url)
@@ -340,14 +352,21 @@ class MainWindow(QMainWindow):
         self._info_worker.playlist_ready.connect(self._on_playlist_ready)
         self._info_worker.error.connect(self._on_info_error)
         self._info_worker.status_message.connect(self.status_bar.showMessage)
+        self._info_worker.finished.connect(self._on_info_worker_done)
         self._info_worker.start()
+
+    def _on_info_worker_done(self):
+        """Process the next URL in the info queue, if any."""
+        if self._info_queue:
+            next_url = self._info_queue.popleft()
+            self._start_info_worker(next_url)
 
     def _on_info_ready(self, video_info: VideoInfo):
         video_info.download_type = self.toolbar.download_type
         video_info.selected_quality = self.toolbar.quality
         video_info.ext = self.toolbar.format
 
-        widget = self.download_list.add_item(video_info)
+        self.download_list.add_item(video_info)
         self._start_download(video_info)
         self.status_bar.showMessage("다운로드 시작...")
 
@@ -367,20 +386,12 @@ class MainWindow(QMainWindow):
     # ── Download management ──────────────────────────────────
 
     def _start_download(self, video_info: VideoInfo):
-        """Queue or start a download respecting concurrent limit."""
-        max_concurrent = self._settings.concurrent_downloads
-        if len(self._workers) >= max_concurrent:
-            self._download_queue.append(video_info)
-            widget = self.download_list.get_item(video_info.video_id)
-            if widget:
-                widget.lbl_status.setText("대기중")
-            return
+        """Delegate download to DownloadManager."""
+        widget = self.download_list.get_item(video_info.video_id)
+        if widget and self._dl_manager.active_count >= self._settings.concurrent_downloads:
+            widget.lbl_status.setText("대기중")
 
-        self._launch_worker(video_info)
-
-    def _launch_worker(self, video_info: VideoInfo):
-        from app.workers.download_worker import DownloadWorker
-        worker = DownloadWorker(
+        self._dl_manager.start_download(
             video_info=video_info,
             save_dir=self.toolbar.save_path,
             download_type=self.toolbar.download_type,
@@ -392,18 +403,6 @@ class MainWindow(QMainWindow):
             frame_rate=self.toolbar.frame_rate,
             codec=self.toolbar.codec,
         )
-        worker.progress.connect(self._on_download_progress)
-        worker.finished.connect(self._on_download_finished)
-        worker.error.connect(self._on_download_error)
-        self._workers[video_info.video_id] = worker
-        worker.start()
-
-    def _process_queue(self):
-        """Start queued downloads if slots are available."""
-        max_concurrent = self._settings.concurrent_downloads
-        while self._download_queue and len(self._workers) < max_concurrent:
-            vi = self._download_queue.popleft()
-            self._launch_worker(vi)
 
     def _on_download_progress(self, video_id: str, data: dict):
         widget = self.download_list.get_item(video_id)
@@ -429,20 +428,6 @@ class MainWindow(QMainWindow):
                 download_type=vi.download_type,
             )
 
-        self._workers.pop(video_id, None)
-        self._process_queue()
-
-        active = len(self._workers)
-        queued = len(self._download_queue)
-        if active > 0:
-            msg = f"다운로드 중... ({active}개 진행"
-            if queued > 0:
-                msg += f", {queued}개 대기"
-            msg += ")"
-            self.status_bar.showMessage(msg)
-        else:
-            self.status_bar.showMessage("모든 다운로드 완료")
-
         # Notifications
         title = widget.video_info.title if widget else video_id
         if self._settings.notify_download_complete:
@@ -465,10 +450,7 @@ class MainWindow(QMainWindow):
         widget = self.download_list.get_item(video_id)
         if widget:
             widget.set_error(msg)
-        self._workers.pop(video_id, None)
-        self._process_queue()
         self._reapply_sort()
-        self.status_bar.showMessage(f"오류: {msg}")
 
         # Error notification
         if self._settings.notify_download_error:
@@ -488,9 +470,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _cancel_download(self, video_id: str):
-        worker = self._workers.get(video_id)
-        if worker:
-            worker.cancel()
+        self._dl_manager.cancel_download(video_id)
 
     # ── Tab / Search filtering ──────────────────────────────
 
@@ -549,7 +529,9 @@ class MainWindow(QMainWindow):
     def _open_save_folder(self):
         path = self.toolbar.save_path
         if os.path.isdir(path):
-            os.startfile(path)
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(path)
+            )
 
     def _clear_list(self):
         for item in list(self.download_list.get_all_items()):
@@ -567,17 +549,17 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("이력이 삭제되었습니다")
 
     def _pause_all(self):
-        paused = 0
-        for vid, worker in self._workers.items():
-            if not worker._cancelled:
-                worker.cancel()
-                widget = self.download_list.get_item(vid)
-                if widget:
-                    widget.lbl_status.setText("일시정지")
-                    widget.video_info.status = "paused"
-                paused += 1
-        if paused > 0:
-            self.status_bar.showMessage(f"{paused}개 다운로드 일시정지됨")
+        paused_ids = self._dl_manager.pause_all()
+        for vid in paused_ids:
+            widget = self.download_list.get_item(vid)
+            if widget:
+                widget.lbl_status.setText("일시정지")
+                widget.video_info.status = "paused"
+                widget.progress_bar.setVisible(False)
+
+        count = len(paused_ids)
+        if count > 0:
+            self.status_bar.showMessage(f"{count}개 다운로드 일시정지됨")
         else:
             self.status_bar.showMessage("일시정지할 다운로드가 없습니다")
 
@@ -585,7 +567,7 @@ class MainWindow(QMainWindow):
         resumed = 0
         for item in self.download_list.get_all_items():
             if item.video_info.status == "paused":
-                item.video_info.status = "downloading"
+                item.video_info.status = "pending"
                 item.lbl_status.setText("대기중")
                 self._start_download(item.video_info)
                 resumed += 1
@@ -600,11 +582,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            # Cancel active downloads first
-            for worker in list(self._workers.values()):
-                worker.cancel()
-            self._workers.clear()
-
+            self._dl_manager.cancel_all()
             for item in list(self.download_list.get_all_items()):
                 self.download_list._remove_item(item.video_info.video_id)
             self.status_bar.showMessage("모든 항목이 제거되었습니다")
@@ -762,8 +740,7 @@ class MainWindow(QMainWindow):
         # Actually quit: stop bridge server and cancel all running downloads
         if hasattr(self, '_bridge_server'):
             self._bridge_server.stop()
-        for worker in self._workers.values():
-            worker.cancel()
-            worker.wait(2000)
+        self._dl_manager.cancel_all()
+        self.db.close()
         self.tray_icon.hide()
         event.accept()

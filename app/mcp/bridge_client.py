@@ -1,12 +1,26 @@
 """TCP client for communicating with the Qt app's bridge server."""
 
 import json
+import os
 import socket
 from typing import Any
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 19384
 TIMEOUT = 30  # seconds
+
+# Token file location — must match bridge_server.py
+_TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".youtube_downloader")
+TOKEN_FILE = os.path.join(_TOKEN_DIR, "bridge_token")
+
+
+def _read_token() -> str:
+    """Read the auth token written by BridgeServer."""
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 class BridgeClient:
@@ -24,6 +38,7 @@ class BridgeClient:
             "id": self._req_id,
             "method": method,
             "params": params or {},
+            "token": _read_token(),
         }
         payload = json.dumps(req, ensure_ascii=False).encode("utf-8") + b"\n"
 

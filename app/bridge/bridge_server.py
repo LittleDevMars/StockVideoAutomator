@@ -2,9 +2,15 @@
 
 Listens on localhost:19384 for JSON-RPC 2.0 requests from the MCP server
 process and dispatches them to MainWindow methods on the main thread.
+
+Authentication: A random token is generated on startup and written to a
+token file.  Clients must include ``"token": "<value>"`` in every JSON-RPC
+request object.  Requests with a missing or invalid token are rejected.
 """
 
 import json
+import os
+import secrets
 import traceback
 from typing import Any, Dict, Optional
 
@@ -13,6 +19,10 @@ from PyQt6.QtNetwork import QTcpServer, QTcpSocket, QHostAddress
 
 
 BRIDGE_PORT = 19384
+
+# Token file location — shared between server and client
+_TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".youtube_downloader")
+TOKEN_FILE = os.path.join(_TOKEN_DIR, "bridge_token")
 
 
 class BridgeServer(QObject):
@@ -24,8 +34,12 @@ class BridgeServer(QObject):
         self._server = QTcpServer(self)
         self._clients: list[QTcpSocket] = []
         self._buffers: dict[QTcpSocket, bytes] = {}
+        self._token: str = ""
 
     def start(self) -> bool:
+        self._token = secrets.token_hex(16)
+        self._write_token_file()
+
         ok = self._server.listen(QHostAddress.SpecialAddress.LocalHost, BRIDGE_PORT)
         if ok:
             self._server.newConnection.connect(self._on_new_connection)
@@ -34,12 +48,26 @@ class BridgeServer(QObject):
             print(f"[BridgeServer] Failed to listen: {self._server.errorString()}")
         return ok
 
+    def _write_token_file(self):
+        """Write the auth token to a file readable only by the current user."""
+        os.makedirs(_TOKEN_DIR, exist_ok=True)
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, self._token.encode("utf-8"))
+        finally:
+            os.close(fd)
+
     def stop(self):
         for client in self._clients:
             client.disconnectFromHost()
         self._clients.clear()
         self._buffers.clear()
         self._server.close()
+        # Remove token file on shutdown
+        try:
+            os.remove(TOKEN_FILE)
+        except OSError:
+            pass
 
     def _on_new_connection(self):
         while self._server.hasPendingConnections():
@@ -70,6 +98,12 @@ class BridgeServer(QObject):
             return
 
         req_id = req.get("id")
+
+        # Token authentication
+        if req.get("token") != self._token:
+            self._send_error(sock, req_id, -32600, "Authentication failed: invalid or missing token")
+            return
+
         method = req.get("method", "")
         params = req.get("params", {})
 
